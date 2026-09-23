@@ -44,6 +44,61 @@ client = OpenAI(
     base_url=os.environ.get("AZURE_OPENAI_ENDPOINT")
 )
 
+# ==============================
+# TOKEN USAGE / COST TRACKING
+# ==============================
+# Azure OpenAI rate for the deployed model, $ per 1M tokens.
+# Update these if the underlying deployment model changes.
+PRICE_PER_1M_INPUT = float(os.environ.get("PRICE_PER_1M_INPUT", 0.75))
+PRICE_PER_1M_CACHED_INPUT = float(os.environ.get("PRICE_PER_1M_CACHED_INPUT", 0.08))
+PRICE_PER_1M_OUTPUT = float(os.environ.get("PRICE_PER_1M_OUTPUT", 4.50))
+
+USAGE_LOG_FILE = os.path.join(JSON_FOLDER, "usage_log.json")
+
+
+def log_usage(step, image_label, response):
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+
+    input_tokens = getattr(usage, "input_tokens", 0) or 0
+    cached_tokens = getattr(getattr(usage, "input_tokens_details", None), "cached_tokens", 0) or 0
+    output_tokens = getattr(usage, "output_tokens", 0) or 0
+    billed_input_tokens = max(input_tokens - cached_tokens, 0)
+
+    cost = (
+        billed_input_tokens / 1_000_000 * PRICE_PER_1M_INPUT
+        + cached_tokens / 1_000_000 * PRICE_PER_1M_CACHED_INPUT
+        + output_tokens / 1_000_000 * PRICE_PER_1M_OUTPUT
+    )
+
+    entry = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "step": step,
+        "image": image_label,
+        "input_tokens": input_tokens,
+        "cached_tokens": cached_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "cost_usd": round(cost, 6),
+    }
+
+    log = st.session_state.setdefault("usage_log", [])
+    log.append(entry)
+
+    try:
+        existing = []
+        if os.path.exists(USAGE_LOG_FILE):
+            with open(USAGE_LOG_FILE, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        existing.append(entry)
+        with open(USAGE_LOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+    return entry
+
 if "unique_no" not in st.session_state:
     st.session_state["unique_no"] = uuid.uuid4().hex[:8]
 
@@ -189,6 +244,7 @@ CRITICAL RULES (MUST FOLLOW):
             ]}
         ]
     )
+    log_usage("Planogram Extraction", os.path.basename(planogram_path), response)
 
     result = response.output_text.strip()
     if result.startswith("```"):
@@ -269,6 +325,7 @@ CRITICAL RULES (MUST FOLLOW):
             ]}
         ]
     )
+    log_usage("Actual Shelf Extraction", os.path.basename(actual_path), response)
 
     result = response.output_text.strip()
     if result.startswith("```"):
@@ -415,6 +472,7 @@ CRITICAL RULES (MUST FOLLOW):
             ]}
         ]
     )
+    log_usage("SKU Count Extraction", os.path.basename(shelf_path), response)
 
     result = response.output_text.strip()
     if result.startswith("```"):
@@ -547,6 +605,7 @@ STRICT RULES
             {"role": "system", "content": [{"type": "input_text", "text": comparison_prompt}]}
         ]
     )
+    log_usage("Planogram vs Actual Comparison", "(text-only, no image)", response)
 
     result = response.output_text.strip()
     if result.startswith("```"):
@@ -670,7 +729,8 @@ def extract_prices_from_image(image_path):
             }
         ]
     )
-    
+    log_usage("Price Extraction", os.path.basename(image_path), response)
+
     result = response.output_text.strip().replace("```json", "").replace("```", "")
     data = json.loads(result)
     
@@ -731,6 +791,39 @@ menu = st.radio(
     horizontal=True
 )
 
+
+# ==============================
+# TOKEN USAGE / COST SIDEBAR
+# ==============================
+with st.sidebar:
+    st.header("💵 API Usage & Cost")
+
+    usage_log = st.session_state.get("usage_log", [])
+
+    if usage_log:
+        import pandas as pd
+
+        usage_df = pd.DataFrame(usage_log)
+
+        total_cost = usage_df["cost_usd"].sum()
+        total_tokens = usage_df["total_tokens"].sum()
+
+        st.metric("Total Cost (this session)", f"${total_cost:.4f}")
+        st.metric("Total Tokens", f"{int(total_tokens):,}")
+
+        st.dataframe(
+            usage_df[["timestamp", "step", "image", "input_tokens", "cached_tokens", "output_tokens", "cost_usd"]],
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.download_button(
+            "⬇️ Download Usage Log",
+            data=json.dumps(usage_log, indent=2),
+            file_name="usage_log.json"
+        )
+    else:
+        st.caption("No API calls made yet this session.")
 
 
 if menu == "🔢 SKU Count":
