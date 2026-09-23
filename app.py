@@ -15,6 +15,11 @@ from dotenv import load_dotenv
 # ==============================
 load_dotenv()
 
+# On Streamlit Community Cloud, secrets come from st.secrets, not a .env file.
+for _key in ("AZURE_OPENAI_KEY", "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_MODEL"):
+    if not os.environ.get(_key) and _key in st.secrets:
+        os.environ[_key] = st.secrets[_key]
+
 st.set_page_config(page_title="Planogram AI", layout="wide", page_icon="📊")
 
 UPLOAD_FOLDER = "uploads"
@@ -354,6 +359,80 @@ CRITICAL RULES (MUST FOLLOW):
 #     return data
 
 
+def extract_sku_counts(shelf_path):
+    system_prompt = """
+You are a highly precise retail shelf image parser specialized in SKU facing counts.
+
+Your task is to extract EVERY distinct SKU from a real shelf image and COUNT how many
+times each SKU appears (i.e. how many facings/units are visible), with STRICT visual grounding.
+
+CRITICAL RULES (MUST FOLLOW):
+
+1. ORDERING:
+- Process shelves from TOP to BOTTOM.
+- Within each shelf, read products from LEFT to RIGHT.
+
+2. COUNTING:
+- Count every visible facing of the same SKU (identical brand + variant + size) as one unit.
+- Do NOT count empty gaps or price tags.
+- If a SKU repeats across the same shelf (e.g. 5 boxes of the same product side by side), count all of them.
+
+3. NO HALLUCINATION:
+- Only count products clearly visible in the image.
+- Do NOT guess or invent SKUs that aren't there.
+- If a product is blurry or unreadable, label it "Unidentified [Category]" and still count its visible facings.
+
+4. NAMING FORMAT:
+- Use short, clean names: Brand + Variant/Flavor + Type (e.g. "Ritz Family Size Crackers").
+- The SAME SKU name must be reused consistently whenever it repeats within a shelf.
+
+5. OUTPUT FORMAT (STRICT JSON ONLY):
+{
+  "shelves": [
+    {
+      "shelf_number": 1,
+      "skus": [
+        {"sku": "Product Name", "count": 3},
+        {"sku": "Product Name 2", "count": 5}
+      ]
+    }
+  ]
+}
+
+6. DO NOT:
+- Do not explain anything
+- Do not add comments
+- Do not return anything except JSON
+"""
+
+    response = client.responses.create(
+        model=os.environ["AZURE_OPENAI_MODEL"],
+        input=[
+            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+            {"role": "user", "content": [
+                {"type": "input_text", "text": "Extract SKU-wise facing counts shelf by shelf from this shelf image. Return ONLY JSON."},
+                {"type": "input_image", "image_url": encode_image(shelf_path)}
+            ]}
+        ]
+    )
+
+    result = response.output_text.strip()
+    if result.startswith("```"):
+        result = result.split("```")[1].replace("json", "").strip()
+
+    save_json(result, "sku_counts")
+
+    data = json.loads(result)
+    for shelf in data.get("shelves", []):
+        for item in shelf.get("skus", []):
+            item["sku"] = clean_product_name(item.get("sku"))
+            try:
+                item["count"] = int(item.get("count", 0))
+            except (TypeError, ValueError):
+                item["count"] = 0
+    return data
+
+
 def compare_planogram_vs_actual(planogram_data, actual_data):
     # st.info("🔍 Step 3: Comparing Planogram vs Actual...")
 
@@ -648,13 +727,94 @@ def extract_prices(path):
 
 menu = st.radio(
     "",
-    ["📊 Dashboard", "💰 Price Extraction"],
+    ["📊 Dashboard", "💰 Price Extraction", "🔢 SKU Count"],
     horizontal=True
 )
 
 
 
-if menu == "💰 Price Extraction":
+if menu == "🔢 SKU Count":
+
+    st.header("SKU-wise Facing Count")
+
+    if "sku_count_data" not in st.session_state:
+        st.session_state.sku_count_data = None
+
+    sku_shelf_file = st.file_uploader(
+        "Upload Shelf Image for SKU Count",
+        type=["jpg", "jpeg", "png"],
+        key="sku_shelf"
+    )
+
+    if sku_shelf_file:
+        from PIL import Image, ImageOps
+        img = Image.open(sku_shelf_file)
+        img = ImageOps.exif_transpose(img)
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            st.image(img, caption="Shelf Image", width=400)
+
+    if st.button("Count SKUs", disabled=not sku_shelf_file):
+        with st.spinner("Counting SKUs..."):
+            file_path = save_uploaded_file_high_quality(sku_shelf_file, "sku_shelf.jpg")
+            st.session_state.sku_count_data = extract_sku_counts(file_path)
+
+    sku_count_data = st.session_state.sku_count_data
+
+    if sku_count_data and "shelves" in sku_count_data:
+
+        import pandas as pd
+        import plotly.express as px
+
+        rows = []
+        for shelf in sku_count_data["shelves"]:
+            for item in shelf.get("skus", []):
+                rows.append({
+                    "Shelf": shelf.get("shelf_number"),
+                    "SKU": item.get("sku"),
+                    "Count": item.get("count", 0)
+                })
+
+        df = pd.DataFrame(rows)
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total Shelves", df["Shelf"].nunique() if not df.empty else 0)
+        with col2:
+            st.metric("Unique SKUs", df["SKU"].nunique() if not df.empty else 0)
+        with col3:
+            st.metric("Total Facings", int(df["Count"].sum()) if not df.empty else 0)
+
+        if not df.empty:
+            st.subheader("SKU Count by Shelf")
+            for shelf_no in sorted(df["Shelf"].unique()):
+                subset = df[df["Shelf"] == shelf_no].sort_values("Count", ascending=False)
+                st.markdown(f"### Shelf {shelf_no}")
+                st.dataframe(subset[["SKU", "Count"]], use_container_width=True, hide_index=True)
+
+            st.subheader("Total Facings per SKU")
+            totals = df.groupby("SKU", as_index=False)["Count"].sum().sort_values("Count", ascending=False)
+            fig = px.bar(
+                totals,
+                x="SKU",
+                y="Count",
+                text="Count",
+                color="Count",
+                color_continuous_scale="Blues"
+            )
+            fig.update_traces(textposition="outside")
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.download_button(
+            "⬇️ Download JSON",
+            data=json.dumps(sku_count_data, indent=2),
+            file_name="sku_counts.json"
+        )
+
+    else:
+        st.info("Upload a shelf image and click 'Count SKUs'")
+
+elif menu == "💰 Price Extraction":
 
     st.header("Price Extraction")
 
